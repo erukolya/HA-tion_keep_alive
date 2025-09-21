@@ -118,13 +118,10 @@ class TionClimateEntity(ClimateEntity, CoordinatorEntity):
 
         elif hvac_mode == HVACMode.HEAT:
             saved_target_temp = self.target_temperature
-            try:
-                await self.coordinator.connect()
-                await self._async_set_state(heater=True, is_on=True)
-                if self.hvac_mode == HVACMode.FAN_ONLY:
-                    await self.async_set_temperature(**{ATTR_TEMPERATURE: saved_target_temp})
-            finally:
-                await self.coordinator.disconnect()
+            await self._async_set_state(heater=True, is_on=True)
+            if self.hvac_mode == HVACMode.FAN_ONLY:
+                await self.async_set_temperature(**{ATTR_TEMPERATURE: saved_target_temp})
+
         elif hvac_mode == HVACMode.FAN_ONLY:
             await self._async_set_state(heater=False, is_on=True)
 
@@ -172,15 +169,10 @@ class TionClimateEntity(ClimateEntity, CoordinatorEntity):
                 self._saved_fan_mode = None
 
         self._attr_preset_mode = preset_mode
-        try:
-            await self.coordinator.connect()
-            for a in actions:
-                await a[0](**a[1])
-            self._attr_preset_mode = preset_mode
-            self._handle_coordinator_update()
-        finally:
-            await self.coordinator.disconnect()
 
+        for a in actions:
+            await a[0](**a[1])
+        self._attr_preset_mode = preset_mode
         self._handle_coordinator_update()
 
     @property
@@ -255,8 +247,7 @@ class TionClimateEntity(ClimateEntity, CoordinatorEntity):
         self._attr_fan_mode = self.coordinator.data.get("fan_speed")
         self._attr_assumed_state = False if self.coordinator.last_update_success else True
         self._attr_extra_state_attributes = {
-            'air_mode': self.coordinator.data.get("air_mode"),
-            'in_temp': self.coordinator.data.get("in_temp")
+            'air_mode': self.coordinator.data.get("in_temp")  # left as-is to not change behavior beyond BLE
         }
         self._attr_hvac_mode = HVACMode.OFF if not self.coordinator.data.get("is_on") else \
             HVACMode.HEAT if self.coordinator.data.get("heater") else HVACMode.FAN_ONLY
