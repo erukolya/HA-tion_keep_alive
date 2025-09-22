@@ -49,13 +49,12 @@ async def async_setup_entry(hass, config_entry: ConfigEntry):
 
 
 class TionInstance(DataUpdateCoordinator):
-    """Экземпляр устройства Tion с постоянным BLE-соединением и автопереподключением."""
+    """Экземпляр устройства Tion с постоянным BLE-соединением, пост-коннект рукопожатием и автопереподключением."""
 
     def __init__(self, hass: HomeAssistant, config_entry: ConfigEntry):
         self._config_entry: ConfigEntry = config_entry
 
         assert self.config[CONF_MAC] is not None
-        # https://developers.home-assistant.io/docs/network_discovery/#fetching-the-bleak-bledevice-from-the-address
         btle_device = bluetooth.async_ble_device_from_address(hass, self.config[CONF_MAC], connectable=True)
         if btle_device is None:
             raise ConfigEntryNotReady
@@ -68,19 +67,20 @@ class TionInstance(DataUpdateCoordinator):
             pass
         self.__keep_alive = timedelta(seconds=keep_alive_seconds)
 
-        # короткая задержка для повторного подключения при обрыве
+        # задержки
         self._reconnect_delay = timedelta(seconds=10)
+        self._handshake_timeout_s = 2.0     # сколько максимум ждём discovery/notifications после connect
+        self._handshake_poll_s = 0.05       # как часто проверяем статус
 
-        # сам объект протокола
+        # объект протокола
         self.__tion: Tion = self.getTion(self.model, btle_device)
 
-        # состояние и синхронизация подключения
+        # состояние соединения
         self._is_connected: bool = False
         self._connect_lock = asyncio.Lock()
 
         self.rssi: int = 0
 
-        # чиним unique_id при необходимости
         if self._config_entry.unique_id is None:
             _LOGGER.critical(
                 f"Unique id is None for {self._config_entry.title}! Will fix it by using {self.unique_id}"
@@ -141,16 +141,50 @@ class TionInstance(DataUpdateCoordinator):
         """Temperature for away mode"""
         return self.config.get(CONF_AWAY_TEMP, TION_SCHEMA[CONF_AWAY_TEMP]["default"])
 
+    # ------------- утилиты -------------
+
+    def _mark_disconnected(self, reason: str) -> None:
+        if self._is_connected:
+            _LOGGER.warning(
+                "BLE: marked disconnected (%s). Will retry in %ss.",
+                reason,
+                int(self._reconnect_delay.total_seconds()),
+            )
+        self._is_connected = False
+        self.update_interval = self._reconnect_delay
+
+    async def _wait_until_ready(self) -> None:
+        """Ждём, пока внутри tion_btle завершится discovery/enable notifications.
+
+        Библиотека ведёт атрибут connection_status: 'disc'|'connected'.
+        Иногда connect() возвращает до того, как статус стал 'connected'.
+        """
+        # если у объекта нет такого атрибута — считаем, что он готов
+        status = getattr(self.__tion, "connection_status", None)
+        if status is None:
+            return
+
+        waited = 0.0
+        while getattr(self.__tion, "connection_status", None) != "connected" and waited < self._handshake_timeout_s:
+            await asyncio.sleep(self._handshake_poll_s)
+            waited += self._handshake_poll_s
+
+        if getattr(self.__tion, "connection_status", None) != "connected":
+            # не дождались — пусть верхний слой попробует ещё раз
+            raise UpdateFailed("Handshake timeout: BLE services are not ready")
+
     # ------------- управление соединением -------------
 
     async def _ensure_connected(self) -> None:
-        """Гарантирует активное BLE-соединение; безопасно вызывается конкурентно."""
+        """Гарантирует активное BLE-соединение и готовность сервисов; безопасно вызывается конкурентно."""
         async with self._connect_lock:
             if self._is_connected:
                 return
             _LOGGER.debug("BLE: connecting to Tion (%s) in persistent mode…", self.unique_id)
             try:
                 await self.__tion.connect()
+                # дождаться discovery/notifications
+                await self._wait_until_ready()
                 self._is_connected = True
                 _LOGGER.info("BLE: connected to %s (persistent).", self.unique_id)
             except Exception as e:
@@ -158,20 +192,13 @@ class TionInstance(DataUpdateCoordinator):
                 _LOGGER.error("BLE: connect failed: %s", e)
                 raise
 
-    def _mark_disconnected(self, reason: str) -> None:
-        if self._is_connected:
-            _LOGGER.warning("BLE: marked disconnected (%s). Will retry in %ss.", reason, int(self._reconnect_delay.total_seconds()))
-        self._is_connected = False
-        # ускоряем следующую попытку опроса/переподключения
-        self.update_interval = self._reconnect_delay
-
     async def connect(self):
-        """Совместимость с существующими вызовами: просто гарантируем соединение (не рвём постоянное)."""
+        """Совместимость: просто гарантируем соединение (персистентность не нарушаем)."""
         await self._ensure_connected()
         return True
 
     async def disconnect(self):
-        """Ничего не делаем умышленно — соединение должно быть постоянным."""
+        """Ничего не делаем — соединение должно быть постоянным."""
         _LOGGER.debug("BLE: disconnect() ignored in persistent mode.")
         return True
 
@@ -182,27 +209,38 @@ class TionInstance(DataUpdateCoordinator):
         return state == "on"
 
     async def async_update_state(self):
-        """Периодическое обновление состояния с автопереподключением."""
+        """Периодическое обновление состояния с автопереподключением и мягким повтором при раннем запросе."""
         self.logger.info("Tion instance update started")
         response: dict[str, str | bool | int] = {}
 
         try:
             await self._ensure_connected()
             response = await self.__tion.get()
-            # раз успешно — возвращаем нормальный интервал keep_alive
-            self.update_interval = self.__keep_alive
+            self.update_interval = self.__keep_alive  # успех — вернуть нормальный интервал
 
         except MaxTriesExceededError as e:
-            self._mark_disconnected(f"MaxTriesExceededError: {e}")
-            raise UpdateFailed("MaxTriesExceededError") from e
+            # Возможно, не успел завершиться Service Discovery → коротко подождём и повторим один раз
+            if getattr(self.__tion, "connection_status", None) != "connected":
+                try:
+                    await self._wait_until_ready()
+                    response = await self.__tion.get()
+                    self.update_interval = self.__keep_alive
+                except Exception as inner:
+                    self._mark_disconnected(f"MaxTriesExceededError (handshake): {inner}")
+                    raise UpdateFailed("MaxTriesExceededError during handshake") from inner
+            else:
+                self._mark_disconnected(f"MaxTriesExceededError: {e}")
+                raise UpdateFailed("MaxTriesExceededError") from e
+
         except bleak.BleakError as e:
             self._mark_disconnected(f"BleakError: {e}")
             raise UpdateFailed(f"BleakError: {e}") from e
+
         except Exception as e:
-            # Любая иная ошибка тоже переводит нас в retry-режим
             self._mark_disconnected(f"{type(e).__name__}: {e}")
             raise
 
+        # нормализация полей
         response["is_on"] = self._decode_state(response["state"])
         response["heater"] = self._decode_state(response["heater"])
         response["is_heating"] = self._decode_state(response["heating"])
@@ -214,7 +252,7 @@ class TionInstance(DataUpdateCoordinator):
         return response
 
     async def set(self, **kwargs):
-        """Отправка команд в режиме постоянного соединения + автопереподключение."""
+        """Отправка команд в постоянном соединении + автопереподключение + мягкий повтор на раннем запросе."""
         if "fan_speed" in kwargs:
             kwargs["fan_speed"] = int(kwargs["fan_speed"])
 
@@ -234,9 +272,22 @@ class TionInstance(DataUpdateCoordinator):
             # локально применяем изменения, чтобы UI не «плавал»
             self.data.update(original_args)
             self.async_update_listeners()
+
+        except MaxTriesExceededError as e:
+            if getattr(self.__tion, "connection_status", None) != "connected":
+                # быстрый повтор после рукопожатия
+                await self._wait_until_ready()
+                await self.__tion.set(kwargs)
+                self.data.update(original_args)
+                self.async_update_listeners()
+            else:
+                self._mark_disconnected(f"MaxTriesExceededError on set: {e}")
+                raise
+
         except bleak.BleakError as e:
             self._mark_disconnected(f"BleakError on set: {e}")
             raise
+
         except Exception as e:
             self._mark_disconnected(f"{type(e).__name__} on set: {e}")
             raise
