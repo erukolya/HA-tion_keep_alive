@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import time
 from datetime import timedelta
 from functools import cached_property
 
@@ -49,7 +50,7 @@ async def async_setup_entry(hass, config_entry: ConfigEntry):
 
 
 class TionInstance(DataUpdateCoordinator):
-    """Экземпляр устройства Tion с постоянным BLE-соединением, пост-коннект рукопожатием и автопереподключением."""
+    """Экземпляр Tion c постоянным BLE-соединением, «праймингом» сервисов после коннекта и автопереподключением."""
 
     def __init__(self, hass: HomeAssistant, config_entry: ConfigEntry):
         self._config_entry: ConfigEntry = config_entry
@@ -69,8 +70,10 @@ class TionInstance(DataUpdateCoordinator):
 
         # задержки
         self._reconnect_delay = timedelta(seconds=10)
-        self._handshake_timeout_s = 2.0     # сколько максимум ждём discovery/notifications после connect
-        self._handshake_poll_s = 0.05       # как часто проверяем статус
+
+        # Параметры хэндшейка/прайминга
+        self._prime_timeout_s = 8.0      # общее окно, чтобы «раскачать» сервисы после connect()
+        self._prime_sleep_s = 0.25       # пауза между попытками get() во время прайминга
 
         # объект протокола
         self.__tion: Tion = self.getTion(self.model, btle_device)
@@ -153,25 +156,35 @@ class TionInstance(DataUpdateCoordinator):
         self._is_connected = False
         self.update_interval = self._reconnect_delay
 
-    async def _wait_until_ready(self) -> None:
-        """Ждём, пока внутри tion_btle завершится discovery/enable notifications.
+    async def _prime_services(self) -> None:
+        """После connect() делаем лёгкие попытки get(), чтобы добить service discovery/notifications в bleak.
 
-        Библиотека ведёт атрибут connection_status: 'disc'|'connected'.
-        Иногда connect() возвращает до того, как статус стал 'connected'.
+        Наблюдаем два типа сбоев:
+          - MaxTriesExceededError внутри tion_btle после 3 неудачных write;
+          - bleak.BleakError('Service Discovery has not been performed yet').
+        Здесь мы не рвём соединение, а коротко ждём и пробуем снова в пределах таймаута.
         """
-        # если у объекта нет такого атрибута — считаем, что он готов
-        status = getattr(self.__tion, "connection_status", None)
-        if status is None:
-            return
+        started = time.monotonic()
+        last_err: Exception | None = None
 
-        waited = 0.0
-        while getattr(self.__tion, "connection_status", None) != "connected" and waited < self._handshake_timeout_s:
-            await asyncio.sleep(self._handshake_poll_s)
-            waited += self._handshake_poll_s
+        while time.monotonic() - started < self._prime_timeout_s:
+            try:
+                # Этот вызов запускает внутри tion_btle первую запись и подписку на нотификации.
+                await self.__tion.get()
+                return  # успех — сервисы «раскачали»
+            except MaxTriesExceededError as e:
+                last_err = e
+                await asyncio.sleep(self._prime_sleep_s)
+            except bleak.BleakError as e:
+                last_err = e
+                # типичный текст: "Service Discovery has not been performed yet"
+                await asyncio.sleep(self._prime_sleep_s)
+            except Exception as e:
+                # Любая другая ошибка — не считаем «ожидаемой» в прайминге
+                raise UpdateFailed(f"Handshake failed with unexpected error: {e}") from e
 
-        if getattr(self.__tion, "connection_status", None) != "connected":
-            # не дождались — пусть верхний слой попробует ещё раз
-            raise UpdateFailed("Handshake timeout: BLE services are not ready")
+        # Если сюда дошли — за отведённое окно сервисы так и не поднялись
+        raise UpdateFailed(f"Handshake timeout: BLE services are not ready") from last_err
 
     # ------------- управление соединением -------------
 
@@ -183,8 +196,8 @@ class TionInstance(DataUpdateCoordinator):
             _LOGGER.debug("BLE: connecting to Tion (%s) in persistent mode…", self.unique_id)
             try:
                 await self.__tion.connect()
-                # дождаться discovery/notifications
-                await self._wait_until_ready()
+                # Сразу «праймим» сервисы: это безопасно и гарантирует готовность к первым get/set
+                await self._prime_services()
                 self._is_connected = True
                 _LOGGER.info("BLE: connected to %s (persistent).", self.unique_id)
             except Exception as e:
@@ -215,26 +228,28 @@ class TionInstance(DataUpdateCoordinator):
 
         try:
             await self._ensure_connected()
+            # После ensure_connected() сервисы уже «раскачаны», обычный get()
             response = await self.__tion.get()
             self.update_interval = self.__keep_alive  # успех — вернуть нормальный интервал
 
         except MaxTriesExceededError as e:
-            # Возможно, не успел завершиться Service Discovery → коротко подождём и повторим один раз
-            if getattr(self.__tion, "connection_status", None) != "connected":
-                try:
-                    await self._wait_until_ready()
-                    response = await self.__tion.get()
-                    self.update_interval = self.__keep_alive
-                except Exception as inner:
-                    self._mark_disconnected(f"MaxTriesExceededError (handshake): {inner}")
-                    raise UpdateFailed("MaxTriesExceededError during handshake") from inner
-            else:
-                self._mark_disconnected(f"MaxTriesExceededError: {e}")
-                raise UpdateFailed("MaxTriesExceededError") from e
+            # Теоретически не должны сюда попадать, но подстрахуемся: ещё раз коротко праймим и повторяем get()
+            try:
+                await self._prime_services()
+                response = await self.__tion.get()
+                self.update_interval = self.__keep_alive
+            except Exception as inner:
+                self._mark_disconnected(f"MaxTriesExceededError after connect: {inner}")
+                raise UpdateFailed("MaxTriesExceededError after connect") from inner
 
         except bleak.BleakError as e:
             self._mark_disconnected(f"BleakError: {e}")
             raise UpdateFailed(f"BleakError: {e}") from e
+
+        except UpdateFailed as e:
+            # Прокидываем наш хэндшейк-таймаут как есть
+            self._mark_disconnected(str(e))
+            raise
 
         except Exception as e:
             self._mark_disconnected(f"{type(e).__name__}: {e}")
@@ -273,16 +288,12 @@ class TionInstance(DataUpdateCoordinator):
             self.data.update(original_args)
             self.async_update_listeners()
 
-        except MaxTriesExceededError as e:
-            if getattr(self.__tion, "connection_status", None) != "connected":
-                # быстрый повтор после рукопожатия
-                await self._wait_until_ready()
-                await self.__tion.set(kwargs)
-                self.data.update(original_args)
-                self.async_update_listeners()
-            else:
-                self._mark_disconnected(f"MaxTriesExceededError on set: {e}")
-                raise
+        except MaxTriesExceededError:
+            # Если внезапно словили ранний запрос — праймим и повторяем единожды
+            await self._prime_services()
+            await self.__tion.set(kwargs)
+            self.data.update(original_args)
+            self.async_update_listeners()
 
         except bleak.BleakError as e:
             self._mark_disconnected(f"BleakError on set: {e}")
