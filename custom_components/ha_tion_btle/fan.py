@@ -33,10 +33,43 @@ config = FanEntityDescription(
 )
 
 
-async def async_setup_entry(hass: HomeAssistant, _config: ConfigEntry, async_add_entities):
-    """Set up the sensor entry"""
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+):
+    """Set up Tion fan platform for a config entry."""
+    bucket = hass.data.get(DOMAIN, {})
 
-    async_add_entities([TionFan(config, hass.data[DOMAIN][_config.unique_id], hass)])
+    candidates: list[str] = []
+    uid = getattr(config_entry, "unique_id", None)
+    if uid:
+        candidates += [uid, uid.upper(), uid.lower()]
+
+    mac = getattr(config_entry, "data", {}).get("mac")
+    if mac:
+        candidates += [mac, mac.upper(), mac.lower()]
+
+    eid = getattr(config_entry, "entry_id", None)
+    if eid:
+        candidates.append(eid)
+
+    tion_instance = None
+    for key in [k for k in candidates if k]:
+        if key in bucket:
+            tion_instance = bucket[key]
+            break
+
+    if not tion_instance:
+        _LOGGER.error(
+            "Tion (fan): instance for %s not found in hass.data[%s]. Available keys: %s",
+            uid or mac or eid,
+            DOMAIN,
+            ", ".join(bucket.keys()),
+        )
+        return False
+
+    async_add_entities([TionFan(config_entry, tion_instance, hass)])
     return True
 
 
