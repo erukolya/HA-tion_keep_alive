@@ -134,7 +134,7 @@ class TionInstance:
         self._services_ready = asyncio.Event()
         self._services_ready.clear()
         # Тайминги "долгого" 4S: увеличиваем окно на handshake/discovery
-        self._prime_timeout_s: float = 30.0  # было 8–12, мало при слабом сигнале
+        self._prime_timeout_s: float = 60.0  # было 8–12, мало при слабом сигнале
         self._prime_sleep_s: float = 0.25
         # ------------------------------------------------
 
