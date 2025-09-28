@@ -38,36 +38,16 @@ async def async_setup_entry(
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ):
-    """Set up Tion fan platform for a config entry."""
-    bucket = hass.data.get(DOMAIN, {})
-
-    candidates: list[str] = []
-    uid = getattr(config_entry, "unique_id", None)
-    if uid:
-        candidates += [uid, uid.upper(), uid.lower()]
-
-    mac = getattr(config_entry, "data", {}).get("mac")
-    if mac:
-        candidates += [mac, mac.upper(), mac.lower()]
-
-    eid = getattr(config_entry, "entry_id", None)
-    if eid:
-        candidates.append(eid)
-
-    tion_instance = None
-    for key in [k for k in candidates if k]:
-        if key in bucket:
-            tion_instance = bucket[key]
-            break
+    """Set up Tion fan entity for this config entry."""
+    domain_data = hass.data.get(DOMAIN) or {}
+    tion_instance: TionInstance | None = domain_data.get(config_entry.unique_id)
 
     if not tion_instance:
         _LOGGER.error(
-            "Tion (fan): instance for %s not found in hass.data[%s]. Available keys: %s",
-            uid or mac or eid,
-            DOMAIN,
-            ", ".join(bucket.keys()),
+            "ha_tion_btle/fan: нет TionInstance для %s — отложу настройку платформы.",
+            config_entry.unique_id,
         )
-        return False
+        return
 
     async_add_entities([TionFan(config_entry, tion_instance, hass)])
     return True
