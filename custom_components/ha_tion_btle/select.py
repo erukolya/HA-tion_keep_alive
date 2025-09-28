@@ -18,13 +18,40 @@ INPUT_SELECTS: tuple[SelectEntityDescription, ...] = (
 )
 
 
-async def async_setup_entry(hass: HomeAssistant, config: ConfigEntry, async_add_entities):
-    """Set up the sensor entry"""
-    tion_instance = hass.data[DOMAIN][config.unique_id]
-    entities: list[TionInputSelect] = [
-        TionInputSelect(description, tion_instance, hass) for description in INPUT_SELECTS]
-    async_add_entities(entities)
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+):
+    """Set up Tion select platform for a config entry."""
+    bucket = hass.data.get(DOMAIN, {})
 
+    candidates: list[str] = []
+    uid = getattr(config_entry, "unique_id", None)
+    if uid:
+        candidates += [uid, uid.upper(), uid.lower()]
+
+    mac = getattr(config_entry, "data", {}).get("mac")
+    if mac:
+        candidates += [mac, mac.upper(), mac.lower()]
+
+    eid = getattr(config_entry, "entry_id", None)
+    if eid:
+        candidates.append(eid)
+
+    tion_instance = None
+    for key in [k for k in candidates if k]:
+        if key in bucket:
+            tion_instance = bucket[key]
+            break
+
+    if not tion_instance:
+        # В этом файле раньше не логировали — просто выходим «мягко».
+        return False
+
+    async_add_entities(
+        [TionSelect(TionSelectConfig(**dict(config_entry.data)), tion_instance, hass)]
+    )
     return True
 
 
