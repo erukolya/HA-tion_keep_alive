@@ -175,10 +175,17 @@ class TionInstance(DataUpdateCoordinator):
             except MaxTriesExceededError as e:
                 last_err = e
                 await asyncio.sleep(self._prime_sleep_s)
-            except bleak.BleakError as e:
-                last_err = e
-                # типичный текст: "Service Discovery has not been performed yet"
-                await asyncio.sleep(self._prime_sleep_s)
+            except bleak.BleakError as e:            
+                start = time.monotonic()            
+                try:
+                    await self._prime_services()           # ждём до _prime_timeout_s (60с)
+                    response = await self.__tion.get()     # пробуем ещё раз
+                    self.update_interval = self.__keep_alive
+                except Exception as inner:
+                    waited = time.monotonic() - start
+                    # Здесь прайминг уже закончился (успешно или по таймауту), теперь реально “отключаемся”
+                    self._mark_disconnected(f"BleakError after re-prime ({waited:.1f}s): {inner}")
+                    raise UpdateFailed(f"BleakError after re-prime ({waited:.1f}s): {inner}") from inner
             except Exception as e:
                 # Любая другая ошибка — не считаем «ожидаемой» в прайминге
                 raise UpdateFailed(f"Handshake failed with unexpected error: {e}") from e
