@@ -67,13 +67,46 @@ async def async_setup_platform(_hass: HomeAssistant, _config, _async_add_entitie
     return False
 
 
-async def async_setup_entry(hass: HomeAssistant, config: ConfigEntry, async_add_entities):
-    """Set up the sensor entry"""
-    tion_instance = hass.data[DOMAIN][config.unique_id]
-    entities: list[TionSensor] = [
-        TionSensor(description, tion_instance) for description in SENSOR_TYPES]
-    async_add_entities(entities)
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+):
+    """Set up the sensor platform for a config entry."""
+    bucket = hass.data.get(DOMAIN, {})
 
+    candidates: list[str] = []
+    uid = getattr(config_entry, "unique_id", None)
+    if uid:
+        candidates += [uid, uid.upper(), uid.lower()]
+
+    mac = getattr(config_entry, "data", {}).get("mac")
+    if mac:
+        candidates += [mac, mac.upper(), mac.lower()]
+
+    eid = getattr(config_entry, "entry_id", None)
+    if eid:
+        candidates.append(eid)
+
+    tion_instance = None
+    for key in [k for k in candidates if k]:
+        if key in bucket:
+            tion_instance = bucket[key]
+            break
+
+    if not tion_instance:
+        _LOGGER.error(
+            "Tion (sensor): instance for %s not found in hass.data[%s]. Available keys: %s",
+            uid or mac or eid,
+            DOMAIN,
+            ", ".join(bucket.keys()),
+        )
+        return False
+
+    entities: list[TionSensor] = [
+        TionSensor(description, tion_instance) for description in SENSOR_TYPES
+    ]
+    async_add_entities(entities)
     return True
 
 
