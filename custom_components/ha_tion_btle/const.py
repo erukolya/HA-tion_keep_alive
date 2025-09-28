@@ -17,6 +17,7 @@ CONF_KEEP_ALIVE = "keep_alive"
 CONF_INITIAL_HVAC_MODE = "initial_hvac_mode"
 CONF_AWAY_TEMP = "away_temp"
 CONF_MAC = "mac"
+CONF_MODEL = "model" 
 PLATFORMS = [Platform.SENSOR, Platform.CLIMATE, Platform.SELECT, Platform.FAN]
 SUPPORTED_DEVICES = ['S3', 'S4', 'Lite']
 
