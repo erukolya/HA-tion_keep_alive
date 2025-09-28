@@ -20,38 +20,24 @@ INPUT_SELECTS: tuple[SelectEntityDescription, ...] = (
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
+    config: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ):
-    """Set up Tion select platform for a config entry."""
-    bucket = hass.data.get(DOMAIN, {})
-
-    candidates: list[str] = []
-    uid = getattr(config_entry, "unique_id", None)
-    if uid:
-        candidates += [uid, uid.upper(), uid.lower()]
-
-    mac = getattr(config_entry, "data", {}).get("mac")
-    if mac:
-        candidates += [mac, mac.upper(), mac.lower()]
-
-    eid = getattr(config_entry, "entry_id", None)
-    if eid:
-        candidates.append(eid)
-
-    tion_instance = None
-    for key in [k for k in candidates if k]:
-        if key in bucket:
-            tion_instance = bucket[key]
-            break
+    """Set up Tion selects for this config entry."""
+    domain_data = hass.data.get(DOMAIN) or {}
+    tion_instance: TionInstance | None = domain_data.get(config.unique_id)
 
     if not tion_instance:
-        # В этом файле раньше не логировали — просто выходим «мягко».
-        return False
+        _LOGGER.error(
+            "ha_tion_btle/select: нет TionInstance для %s — отложу настройку платформы.",
+            config.unique_id,
+        )
+        return
 
-    async_add_entities(
-        [TionSelect(TionSelectConfig(**dict(config_entry.data)), tion_instance, hass)]
-    )
+    entities: list[TionInputSelect] = [
+        TionInputSelect(description, tion_instance, hass) for description in INPUT_SELECTS
+    ]
+    async_add_entities(entities)
     return True
 
 
