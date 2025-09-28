@@ -72,7 +72,7 @@ class TionInstance(DataUpdateCoordinator):
         self._reconnect_delay = timedelta(seconds=10)
 
         # Параметры хэндшейка/прайминга
-        self._prime_timeout_s = 8.0      # общее окно, чтобы «раскачать» сервисы после connect()
+        self._prime_timeout_s = 60.0      # общее окно, чтобы «раскачать» сервисы после connect()
         self._prime_sleep_s = 0.25       # пауза между попытками get() во время прайминга
 
         # объект протокола
