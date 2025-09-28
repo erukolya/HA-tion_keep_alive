@@ -35,27 +35,60 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
 devices = []
 
 
-async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, async_add_entities: AddEntitiesCallback):
-    """Setup entry"""
-    tion_instance: TionInstance = hass.data[DOMAIN][config_entry.unique_id]
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+):
+    """Set up Tion climate platform for a config entry."""
+    bucket = hass.data.get(DOMAIN, {})
+
+    # Кандидаты ключей для поиска инстанса
+    candidates: list[str] = []
+    uid = getattr(config_entry, "unique_id", None)
+    if uid:
+        candidates += [uid, uid.upper(), uid.lower()]
+
+    mac = getattr(config_entry, "data", {}).get("mac")
+    if mac:
+        candidates += [mac, mac.upper(), mac.lower()]
+
+    eid = getattr(config_entry, "entry_id", None)
+    if eid:
+        candidates.append(eid)
+
+    tion_instance = None
+    for key in [k for k in candidates if k]:
+        if key in bucket:
+            tion_instance = bucket[key]
+            break
+
+    if not tion_instance:
+        _LOGGER.error(
+            "Tion: instance for %s not found in hass.data[%s]. Available keys: %s",
+            uid or mac or eid,
+            DOMAIN,
+            ", ".join(bucket.keys()),
+        )
+        return False
+
     unique_id = tion_instance.unique_id
 
     if unique_id not in devices:
         devices.append(unique_id)
         async_add_entities([TionClimateEntity(hass, tion_instance)])
     else:
-        _LOGGER.warning(f"Device {unique_id} is already configured! ")
+        _LOGGER.warning("Device %s is already configured!", unique_id)
 
     platform = entity_platform.async_get_current_platform()
     platform.async_register_entity_service(
         "set_air_source",
-        {
-            vol.Required("source"): vol.In(tion_instance.supported_air_sources),
-        },
+        {vol.Required("source"): vol.In(tion_instance.supported_air_sources)},
         "set_air_source",
     )
 
     return True
+
 
 
 class TionClimateEntity(ClimateEntity, CoordinatorEntity):
