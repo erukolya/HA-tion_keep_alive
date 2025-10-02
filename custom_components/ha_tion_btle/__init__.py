@@ -21,6 +21,9 @@ from tion_btle.tion import Tion, MaxTriesExceededError
 
 from .const import DOMAIN, TION_SCHEMA, CONF_KEEP_ALIVE, CONF_AWAY_TEMP, CONF_MAC, PLATFORMS
 
+# Один коннект за раз на весь процесс (гасим гонку между устройствами)
+GLOBAL_BLE_CONNECT_SEM = asyncio.Semaphore(1)
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -53,6 +56,12 @@ class TionInstance(DataUpdateCoordinator):
     """Экземпляр Tion c постоянным BLE-соединением, «праймингом» сервисов после коннекта и автопереподключением."""
 
     def __init__(self, hass: HomeAssistant, config_entry: ConfigEntry):
+        # Защита от параллельных write/notify к одному устройству
+        self._io_lock = asyncio.Lock()
+
+        # Небольшая задержка после удачного connect перед первым get()
+        self._initial_settle_s = 1.5  # можешь поднять до 2.0–3.0, если нужно
+        
         self._config_entry: ConfigEntry = config_entry
 
         assert self.config[CONF_MAC] is not None
@@ -148,7 +157,7 @@ class TionInstance(DataUpdateCoordinator):
     
     
     def _mark_disconnected(self, reason: str) -> None:
-        # экспоненциальный бэкофф: 10s, 20s, 40s, 60s (потолок)
+        # экспоненциальный бэкофф: 10 → 20 → 40 → 60 (потолок)
         fail_count = getattr(self, "_fail_count", 0) + 1
         setattr(self, "_fail_count", fail_count)
         backoff_s = min(10 * (2 ** (fail_count - 1)), 60)
@@ -171,23 +180,23 @@ class TionInstance(DataUpdateCoordinator):
         self.update_interval = self._reconnect_delay
 
     def _bleak_service_not_ready(self, err: Exception) -> bool:
-        """Возвращает True для типовой ситуации, когда Bleak ещё не завершил service discovery."""
         msg = str(err) or ""
         return "Service Discovery has not been performed yet" in msg or "services are not ready" in msg
 
-
     async def _prime_services(self) -> None:
-        """После connect() мягко «раскачиваем» сервисы, пока Bleak не закончит service discovery/notify."""
+        """После connect() мягко «раскачиваем» сервисы, пока Bleak не завершит service discovery/notify."""
         started = time.monotonic()
         last_err: Exception | None = None
     
-        # маленькая стартовая пауза помогает стеку BLE (особенно на Linux/BlueZ)
+        # маленькая стартовая пауза помогает BlueZ
         await asyncio.sleep(0.1)
     
         while time.monotonic() - started < self._prime_timeout_s:
             try:
-                await self.__tion.get()   # триггерит первую подписку/операции в tion_btle
-                return                    # успех
+                # Любой вызов к устройству — только через IO-лок
+                async with self._io_lock:
+                    await self.__tion.get()
+                return  # успех
             except MaxTriesExceededError as e:
                 last_err = e
                 await asyncio.sleep(self._prime_sleep_s)
@@ -195,45 +204,50 @@ class TionInstance(DataUpdateCoordinator):
             except bleak.BleakError as e:
                 last_err = e
                 if self._bleak_service_not_ready(e):
-                    # нормальная ситуация во время старта — просто подождём и повторим
+                    # нормальная стадия — даём устройству и стеку ещё чуть-чуть
                     await asyncio.sleep(self._prime_sleep_s)
                     continue
-                # любые другие BleakError — считаем фатальными для хэндшейка
+                # другая BLE-ошибка — считаем фатальной для хэндшейка
                 raise UpdateFailed(f"Handshake failed: {e}") from e
             except Exception as e:
-                # неожиданные исключения — наружу
                 raise UpdateFailed(f"Handshake failed with unexpected error: {e}") from e
     
-        # окно закончилось — сервисы так и не готовы
         raise UpdateFailed("Handshake timeout: BLE services are not ready") from last_err
+
 
 
     # ------------- управление соединением -------------
 
     async def _ensure_connected(self) -> None:
-        """Гарантирует активное BLE-соединение и готовность сервисов; защищено от гонок."""
+        """Гарантирует активное BLE-соединение и готовность сервисов; защищено от гонок и междевайсных коллизий."""
         async with self._connect_lock:
             if self._is_connected:
                 return
     
             _LOGGER.debug("BLE: connecting to Tion (%s) in persistent mode…", self.unique_id)
             try:
-                await self.__tion.connect()
+                # Один коннект за раз на весь процесс — гасим конкуренцию адаптера/BlueZ
+                async with GLOBAL_BLE_CONNECT_SEM:
+                    await self.__tion.connect()
+                # Чуть подождём после факта подключения (BlueZ != мгновенный)
+                await asyncio.sleep(self._initial_settle_s)
+                # Прайминг сервисов с ожиданием до _prime_timeout_s
                 await self._prime_services()
             except Exception as e:
-                # при провале обязательно пытаемся закрыть то, что могло остаться полуподключённым
+                # При любом провале — попытка закрыть «полуподключённое» состояние
                 try:
                     await self.__tion.disconnect()
                 except Exception:
                     pass
+                self._is_connected = False
                 self._mark_disconnected(f"connect/prime failed: {e}")
                 raise
             else:
                 self._is_connected = True
-                # успешный коннект сбрасывает бэкофф и возвращает keep-alive период
-                setattr(self, "_fail_count", 0)
-                self.update_interval = self.__keep_alive
+                setattr(self, "_fail_count", 0)             # сброс бэкоффа
+                self.update_interval = self.__keep_alive    # возвращаем keep-alive
                 _LOGGER.info("BLE: connected to %s (persistent).", self.unique_id)
+
 
     async def connect(self):
         """Совместимость: просто гарантируем соединение (персистентность не нарушаем)."""
@@ -252,22 +266,22 @@ class TionInstance(DataUpdateCoordinator):
         return state == "on"
 
     async def async_update_state(self):
-        """Периодическое обновление состояния с автопереподключением и мягким повтором при раннем запросе."""
+        """Периодическое обновление состояния с автопереподключением; все операции — под IO-лок."""
         self.logger.info("Tion instance update started")
         response: dict[str, str | bool | int] = {}
     
         try:
             await self._ensure_connected()
-            response = await self.__tion.get()
-            # успех — вернуть нормальный период и сбросить бэкофф
+            async with self._io_lock:
+                response = await self.__tion.get()
             setattr(self, "_fail_count", 0)
             self.update_interval = self.__keep_alive
     
         except MaxTriesExceededError as e:
-            # редкий случай — даём шанс, как во время прайминга
             try:
                 await self._prime_services()
-                response = await self.__tion.get()
+                async with self._io_lock:
+                    response = await self.__tion.get()
                 setattr(self, "_fail_count", 0)
                 self.update_interval = self.__keep_alive
             except Exception as inner:
@@ -297,7 +311,6 @@ class TionInstance(DataUpdateCoordinator):
         self.logger.debug(f"Result is {response}")
         return response
 
-
     async def set(self, **kwargs):
         if "fan_speed" in kwargs:
             kwargs["fan_speed"] = int(kwargs["fan_speed"])
@@ -315,10 +328,12 @@ class TionInstance(DataUpdateCoordinator):
         try:
             await self._ensure_connected()
             try:
-                await self.__tion.set(kwargs)
+                async with self._io_lock:
+                    await self.__tion.set(kwargs)
             except MaxTriesExceededError:
                 await self._prime_services()
-                await self.__tion.set(kwargs)
+                async with self._io_lock:
+                    await self.__tion.set(kwargs)
     
             self.data.update(original_args)
             self.async_update_listeners()
