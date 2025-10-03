@@ -417,6 +417,8 @@ class TionInstance(DataUpdateCoordinator):
     
         try:
             await self._ensure_connected()
+    
+            # Внутренний try только под MaxTriesExceededError — делаем единичный re-prime и повтор
             try:
                 async with self._io_lock:
                     await self.__tion.set(kwargs)
@@ -424,20 +426,26 @@ class TionInstance(DataUpdateCoordinator):
                 await self._prime_services()
                 async with self._io_lock:
                     await self.__tion.set(kwargs)
-                # успех — ничего дополнительно
-            
-            except bleak.BleakError as e:
-                if self._bleak_service_not_ready(e):
-                    self._need_hard_reset = True
-                self._mark_disconnected(f"BleakError on set: {e}")
-                raise
-            
-            except Exception as e:
-                self._mark_disconnected(f"{type(e).__name__} on set: {e}")
-                # на всякий случай запросим ресет, если это явно похоже на проблемы GATT/сервиса
-                if "service" in (str(e).lower()):
-                    self._need_hard_reset = True
-                raise
+    
+        except bleak.BleakError as e:
+            if self._bleak_service_not_ready(e):
+                self._need_hard_reset = True
+            self._mark_disconnected(f"BleakError on set: {e}")
+            raise
+    
+        except Exception as e:
+            self._mark_disconnected(f"{type(e).__name__} on set: {e}")
+            # если это похоже на проблему GATT/сервисов — запросим жёсткий ресет
+            if "service" in (str(e).lower()):
+                self._need_hard_reset = True
+            raise
+    
+        else:
+            # успех — обновляем локальное состояние, чтобы UI не «плавал»
+            self.data.update(original_args)
+            self.async_update_listeners()
+            setattr(self, "_fail_count", 0)
+            self.update_interval = self.__keep_alive
 
     # ------------- фабрика устройств и BTLE событийка -------------
 
