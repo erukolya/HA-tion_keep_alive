@@ -182,39 +182,64 @@ class TionInstance(DataUpdateCoordinator):
     def _bleak_service_not_ready(self, err: Exception) -> bool:
         msg = str(err) or ""
         return "Service Discovery has not been performed yet" in msg or "services are not ready" in msg
-
+        
+    async def _hard_reset_connection(self, reason: str, pause_s: float = 0.3) -> None:
+        """Жёстко сбрасывает BLE-сессию и пересоздаёт подключение (без прайминга)."""
+        _LOGGER.warning("BLE: hard reset connection (%s)", reason)
+        self._is_connected = False
+        try:
+            await self.__tion.disconnect()
+        except Exception:
+            pass
+        await asyncio.sleep(pause_s)
+        async with GLOBAL_BLE_CONNECT_SEM:
+            await self.__tion.connect()
+        await asyncio.sleep(self._initial_settle_s)  # даём BlueZ «встать на ноги»
+    
     async def _prime_services(self) -> None:
-        """После connect() мягко «раскачиваем» сервисы, пока Bleak не завершит service discovery/notify."""
+        """После connect() мягко «раскачиваем» сервисы, но если discovery так и не поднялся — делаем full reconnect."""
         started = time.monotonic()
         last_err: Exception | None = None
     
         # маленькая стартовая пауза помогает BlueZ
         await asyncio.sleep(0.1)
     
+        # будем не чаще, чем раз в 5с, пробовать «жёсткий» reset в рамках прайминга (не более 2 раз)
+        last_reset_ts = started
+        resets_done = 0
+    
         while time.monotonic() - started < self._prime_timeout_s:
             try:
-                # Любой вызов к устройству — только через IO-лок
                 async with self._io_lock:
                     await self.__tion.get()
                 return  # успех
             except MaxTriesExceededError as e:
                 last_err = e
+                # Если библиотека сразу уходит в 3/3 — велика вероятность сломанного линка → попробуем hard reset
+                now = time.monotonic()
+                if now - last_reset_ts >= 5.0 and resets_done < 2:
+                    await self._hard_reset_connection("prime: MaxTriesExceeded")
+                    last_reset_ts = now
+                    resets_done += 1
+                    continue
                 await asyncio.sleep(self._prime_sleep_s)
                 continue
             except bleak.BleakError as e:
                 last_err = e
                 if self._bleak_service_not_ready(e):
-                    # нормальная стадия — даём устройству и стеку ещё чуть-чуть
+                    now = time.monotonic()
+                    if now - last_reset_ts >= 5.0 and resets_done < 2:
+                        await self._hard_reset_connection("prime: services not ready")
+                        last_reset_ts = now
+                        resets_done += 1
+                        continue
                     await asyncio.sleep(self._prime_sleep_s)
                     continue
-                # другая BLE-ошибка — считаем фатальной для хэндшейка
                 raise UpdateFailed(f"Handshake failed: {e}") from e
             except Exception as e:
                 raise UpdateFailed(f"Handshake failed with unexpected error: {e}") from e
     
         raise UpdateFailed("Handshake timeout: BLE services are not ready") from last_err
-
-
 
     # ------------- управление соединением -------------
 
@@ -266,7 +291,7 @@ class TionInstance(DataUpdateCoordinator):
         return state == "on"
 
     async def async_update_state(self):
-        """Периодическое обновление состояния с автопереподключением; все операции — под IO-лок."""
+        """Периодический опрос с автопереподключением; при сбое — hard reset линка и единичный повтор."""
         self.logger.info("Tion instance update started")
         response: dict[str, str | bool | int] = {}
     
@@ -277,20 +302,20 @@ class TionInstance(DataUpdateCoordinator):
             setattr(self, "_fail_count", 0)
             self.update_interval = self.__keep_alive
     
-        except MaxTriesExceededError as e:
+        except (MaxTriesExceededError, bleak.BleakError) as e:
+            # Линк мог «залипнуть»: делаем жёсткий reset + прайминг + единичный повтор get()
             try:
+                await self._hard_reset_connection(f"poll failed: {type(e).__name__}")
                 await self._prime_services()
                 async with self._io_lock:
                     response = await self.__tion.get()
                 setattr(self, "_fail_count", 0)
                 self.update_interval = self.__keep_alive
             except Exception as inner:
-                self._mark_disconnected(f"MaxTriesExceeded after connect: {inner}")
-                raise UpdateFailed("MaxTriesExceeded after connect") from inner
-    
-        except bleak.BleakError as e:
-            self._mark_disconnected(f"BleakError: {e}")
-            raise UpdateFailed(f"BleakError: {e}") from e
+                self._mark_disconnected(f"MaxTriesExceeded after connect: {inner}" if isinstance(e, MaxTriesExceededError)
+                                        else f"BleakError after connect: {inner}")
+                raise UpdateFailed("MaxTriesExceeded after connect" if isinstance(e, MaxTriesExceededError)
+                                   else "BleakError after connect") from inner
     
         except UpdateFailed as e:
             self._mark_disconnected(str(e))
@@ -310,6 +335,7 @@ class TionInstance(DataUpdateCoordinator):
     
         self.logger.debug(f"Result is {response}")
         return response
+
 
     async def set(self, **kwargs):
         if "fan_speed" in kwargs:
