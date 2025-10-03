@@ -21,6 +21,8 @@ from tion_btle.tion import Tion, MaxTriesExceededError
 
 from .const import DOMAIN, TION_SCHEMA, CONF_KEEP_ALIVE, CONF_AWAY_TEMP, CONF_MAC, PLATFORMS
 
+import random
+
 # Один коннект за раз на весь процесс (гасим гонку между устройствами)
 GLOBAL_BLE_CONNECT_SEM = asyncio.Semaphore(1)
 
@@ -56,11 +58,17 @@ class TionInstance(DataUpdateCoordinator):
     """Экземпляр Tion c постоянным BLE-соединением, «праймингом» сервисов после коннекта и автопереподключением."""
 
     def __init__(self, hass: HomeAssistant, config_entry: ConfigEntry):
+
+        # Предохранитель (circuit-breaker)
+        self._breaker_until_ts: float = 0.0   # мон.время до которого молчим
+        self._breaker_level: int = 0          # ступень 0..3
+        self._need_hard_reset: bool = False   # запросить жёсткий ресет перед следующим коннектом
+        
+        # Небольшая задержка после удачного connect
+        self._initial_settle_s = 2.5          # было 1.5; можно 3.0 при желании
+        
         # Защита от параллельных write/notify к одному устройству
         self._io_lock = asyncio.Lock()
-
-        # Небольшая задержка после удачного connect перед первым get()
-        self._initial_settle_s = 1.5  # можешь поднять до 2.0–3.0, если нужно
         
         self._config_entry: ConfigEntry = config_entry
 
@@ -157,31 +165,56 @@ class TionInstance(DataUpdateCoordinator):
     
     
     def _mark_disconnected(self, reason: str) -> None:
-        # экспоненциальный бэкофф: 10 → 20 → 40 → 60 (потолок)
+        # экспоненциальный backoff 10→20→40→60 c потолком 60с — для "обычных" отвалов
         fail_count = getattr(self, "_fail_count", 0) + 1
         setattr(self, "_fail_count", fail_count)
         backoff_s = min(10 * (2 ** (fail_count - 1)), 60)
+    
+        # если это таймаут хендшейка/сервисы не поднялись — включаем предохранитель жестче
+        reason_l = (reason or "").lower()
+        is_handshake = (
+            "handshake timeout" in reason_l
+            or "services are not ready" in reason_l
+            or "service discovery has not been performed" in reason_l
+            or "maxtriesexceeded" in reason_l
+        )
+        if is_handshake:
+            self._breaker_level = min(self._breaker_level + 1, 3)
+            # ступени молчания: 15, 45, 120, 300
+            silence = [15, 45, 120, 300][self._breaker_level]
+            # джиттер ±20%, чтобы не столкнуться со вторым устройством
+            silence = int(silence * random.uniform(0.8, 1.2))
+            self._breaker_until_ts = time.monotonic() + silence
+            # просим при следующем подключении сделать жёсткий ресет стека
+            self._need_hard_reset = True
+    
+        # обычный backoff для планировщика координатора
         self._reconnect_delay = timedelta(seconds=backoff_s)
     
         if self._is_connected:
             _LOGGER.warning(
-                "BLE: marked disconnected (%s). Will retry in %ss.",
+                "BLE: marked disconnected (%s). Retry in %ss; breaker=%ss.",
                 reason,
-                int(self._reconnect_delay.total_seconds()),
+                backoff_s,
+                max(0, int(self._breaker_until_ts - time.monotonic())),
             )
         else:
             _LOGGER.debug(
-                "BLE: still disconnected (%s). Next retry in %ss.",
+                "BLE: still disconnected (%s). Next retry in %ss; breaker=%ss.",
                 reason,
-                int(self._reconnect_delay.total_seconds()),
+                backoff_s,
+                max(0, int(self._breaker_until_ts - time.monotonic())),
             )
     
         self._is_connected = False
         self.update_interval = self._reconnect_delay
 
     def _bleak_service_not_ready(self, err: Exception) -> bool:
-        msg = str(err) or ""
-        return "Service Discovery has not been performed yet" in msg or "services are not ready" in msg
+        msg = (str(err) or "").lower()
+        return (
+            "service discovery has not been performed yet" in msg
+            or "services are not ready" in msg
+        )
         
     async def _hard_reset_connection(self, reason: str, pause_s: float = 0.3) -> None:
         """Жёстко сбрасывает BLE-сессию и пересоздаёт подключение (без прайминга)."""
@@ -195,18 +228,28 @@ class TionInstance(DataUpdateCoordinator):
         async with GLOBAL_BLE_CONNECT_SEM:
             await self.__tion.connect()
         await asyncio.sleep(self._initial_settle_s)  # даём BlueZ «встать на ноги»
-    
+
+    async def _hard_reset_ble(self, reason: str) -> None:
+        """Полный ресет: закрыть коннект, выкинуть клиент, пересоздать протокол (без перезапуска HA)."""
+        _LOGGER.warning("BLE HARD RESET (%s): disconnecting and recreating client", reason)
+        try:
+            await self.__tion.disconnect()
+        except Exception:
+            pass
+        # Пересоздаём объект протокола с MAC-адресом (BLEDevice прилетит позже в callback)
+        self.__tion = self.getTion(self.model, self.unique_id)
+        self._is_connected = False
+
     async def _prime_services(self) -> None:
-        """После connect() мягко «раскачиваем» сервисы, но если discovery так и не поднялся — делаем full reconnect."""
+        """Мягко «раскачиваем» GATT: пробуем get() с растущей паузой; при длинной серии NotReady сдаёмся."""
         started = time.monotonic()
         last_err: Exception | None = None
     
-        # маленькая стартовая пауза помогает BlueZ
-        await asyncio.sleep(0.1)
+        # короткая стартовая пауза помогает BlueZ
+        await asyncio.sleep(0.15)
     
-        # будем не чаще, чем раз в 5с, пробовать «жёсткий» reset в рамках прайминга (не более 2 раз)
-        last_reset_ts = started
-        resets_done = 0
+        sleep_s = max(0.25, getattr(self, "_prime_sleep_s", 0.25))
+        not_ready_streak = 0
     
         while time.monotonic() - started < self._prime_timeout_s:
             try:
@@ -215,64 +258,79 @@ class TionInstance(DataUpdateCoordinator):
                 return  # успех
             except MaxTriesExceededError as e:
                 last_err = e
-                # Если библиотека сразу уходит в 3/3 — велика вероятность сломанного линка → попробуем hard reset
-                now = time.monotonic()
-                if now - last_reset_ts >= 5.0 and resets_done < 2:
-                    await self._hard_reset_connection("prime: MaxTriesExceeded")
-                    last_reset_ts = now
-                    resets_done += 1
-                    continue
-                await asyncio.sleep(self._prime_sleep_s)
+                await asyncio.sleep(sleep_s)
+                sleep_s = min(sleep_s * 1.5, 2.0)
                 continue
             except bleak.BleakError as e:
                 last_err = e
                 if self._bleak_service_not_ready(e):
-                    now = time.monotonic()
-                    if now - last_reset_ts >= 5.0 and resets_done < 2:
-                        await self._hard_reset_connection("prime: services not ready")
-                        last_reset_ts = now
-                        resets_done += 1
-                        continue
-                    await asyncio.sleep(self._prime_sleep_s)
+                    not_ready_streak += 1
+                    # если прям лавина NotReady в самом начале — уход в быстрый backoff, не долбим минуту
+                    elapsed = time.monotonic() - started
+                    if not_ready_streak >= 7 and elapsed < 10.0:
+                        raise UpdateFailed("Handshake timeout: BLE services are not ready (fast)") from e
+                    await asyncio.sleep(sleep_s)
+                    sleep_s = min(sleep_s * 1.5, 2.0)
                     continue
+                # другие BLE-ошибки — фатал для хэндшейка
                 raise UpdateFailed(f"Handshake failed: {e}") from e
             except Exception as e:
                 raise UpdateFailed(f"Handshake failed with unexpected error: {e}") from e
     
         raise UpdateFailed("Handshake timeout: BLE services are not ready") from last_err
 
+
     # ------------- управление соединением -------------
 
     async def _ensure_connected(self) -> None:
-        """Гарантирует активное BLE-соединение и готовность сервисов; защищено от гонок и междевайсных коллизий."""
+        """Активное постоянное соединение + готовность сервисов; защищено от гонок/коллизий."""
         async with self._connect_lock:
             if self._is_connected:
                 return
     
+            # предохранитель: если «молчим», даже не начинаем коннект
+            now = time.monotonic()
+            if now < self._breaker_until_ts:
+                remaining = int(self._breaker_until_ts - now)
+                raise UpdateFailed(f"Breaker open: waiting {remaining}s before reconnect")
+    
             _LOGGER.debug("BLE: connecting to Tion (%s) in persistent mode…", self.unique_id)
             try:
-                # Один коннект за раз на весь процесс — гасим конкуренцию адаптера/BlueZ
+                # по запросу — полный ресет клиента перед коннектом
+                if self._need_hard_reset:
+                    await self._hard_reset_ble("requested by breaker")
+                    self._need_hard_reset = False
+    
+                # один коннект на весь процесс
                 async with GLOBAL_BLE_CONNECT_SEM:
                     await self.__tion.connect()
-                # Чуть подождём после факта подключения (BlueZ != мгновенный)
+    
                 await asyncio.sleep(self._initial_settle_s)
-                # Прайминг сервисов с ожиданием до _prime_timeout_s
                 await self._prime_services()
+    
             except Exception as e:
-                # При любом провале — попытка закрыть «полуподключённое» состояние
+                # оборвать возможное полуподключение
                 try:
                     await self.__tion.disconnect()
                 except Exception:
                     pass
+    
                 self._is_connected = False
+    
+                # при таймауте сервисов — просим жёсткий ресет на следующий круг
+                if isinstance(e, UpdateFailed) and "services are not ready" in (str(e).lower()):
+                    self._need_hard_reset = True
+    
                 self._mark_disconnected(f"connect/prime failed: {e}")
                 raise
             else:
                 self._is_connected = True
-                setattr(self, "_fail_count", 0)             # сброс бэкоффа
-                self.update_interval = self.__keep_alive    # возвращаем keep-alive
+                setattr(self, "_fail_count", 0)
+                # закрываем предохранитель
+                self._breaker_until_ts = 0.0
+                self._breaker_level = 0
+                self.update_interval = self.__keep_alive
                 _LOGGER.info("BLE: connected to %s (persistent).", self.unique_id)
-
 
     async def connect(self):
         """Совместимость: просто гарантируем соединение (персистентность не нарушаем)."""
@@ -302,22 +360,28 @@ class TionInstance(DataUpdateCoordinator):
             setattr(self, "_fail_count", 0)
             self.update_interval = self.__keep_alive
     
-        except (MaxTriesExceededError, bleak.BleakError) as e:
-            # Линк мог «залипнуть»: делаем жёсткий reset + прайминг + единичный повтор get()
+        except MaxTriesExceededError as e:
             try:
-                await self._hard_reset_connection(f"poll failed: {type(e).__name__}")
                 await self._prime_services()
                 async with self._io_lock:
                     response = await self.__tion.get()
                 setattr(self, "_fail_count", 0)
                 self.update_interval = self.__keep_alive
             except Exception as inner:
-                self._mark_disconnected(f"MaxTriesExceeded after connect: {inner}" if isinstance(e, MaxTriesExceededError)
-                                        else f"BleakError after connect: {inner}")
-                raise UpdateFailed("MaxTriesExceeded after connect" if isinstance(e, MaxTriesExceededError)
-                                   else "BleakError after connect") from inner
-    
+                # просим жёсткий ресет на следующий круг
+                self._need_hard_reset = True
+                self._mark_disconnected(f"MaxTriesExceeded after connect: {inner}")
+                raise UpdateFailed("MaxTriesExceeded after connect") from inner
+        
+        except bleak.BleakError as e:
+            if self._bleak_service_not_ready(e):
+                self._need_hard_reset = True
+            self._mark_disconnected(f"BleakError: {e}")
+            raise UpdateFailed(f"BleakError: {e}") from e
+        
         except UpdateFailed as e:
+            if "services are not ready" in (str(e).lower()):
+                self._need_hard_reset = True
             self._mark_disconnected(str(e))
             raise
     
@@ -360,18 +424,20 @@ class TionInstance(DataUpdateCoordinator):
                 await self._prime_services()
                 async with self._io_lock:
                     await self.__tion.set(kwargs)
-    
-            self.data.update(original_args)
-            self.async_update_listeners()
-            setattr(self, "_fail_count", 0)
-            self.update_interval = self.__keep_alive
-    
-        except bleak.BleakError as e:
-            self._mark_disconnected(f"BleakError on set: {e}")
-            raise
-        except Exception as e:
-            self._mark_disconnected(f"{type(e).__name__} on set: {e}")
-            raise
+                # успех — ничего дополнительно
+            
+            except bleak.BleakError as e:
+                if self._bleak_service_not_ready(e):
+                    self._need_hard_reset = True
+                self._mark_disconnected(f"BleakError on set: {e}")
+                raise
+            
+            except Exception as e:
+                self._mark_disconnected(f"{type(e).__name__} on set: {e}")
+                # на всякий случай запросим ресет, если это явно похоже на проблемы GATT/сервиса
+                if "service" in (str(e).lower()):
+                    self._need_hard_reset = True
+                raise
 
     # ------------- фабрика устройств и BTLE событийка -------------
 
