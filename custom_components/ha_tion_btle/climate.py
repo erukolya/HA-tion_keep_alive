@@ -70,13 +70,7 @@ class TionClimateEntity(ClimateEntity, CoordinatorEntity):
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_preset_modes = [PRESET_NONE, PRESET_BOOST, PRESET_SLEEP]
     _attr_preset_mode = PRESET_NONE
-   _attr_supported_features = (
-        ClimateEntityFeature.TARGET_TEMPERATURE
-        | ClimateEntityFeature.FAN_MODE
-        | ClimateEntityFeature.PRESET_MODE
-        | ClimateEntityFeature.TURN_ON
-        | ClimateEntityFeature.TURN_OFF
-    )
+    _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.PRESET_MODE | ClimateEntityFeature.TURN_ON | ClimateEntityFeature.TURN_OFF
     _attr_icon = 'mdi:air-purifier'
     _attr_fan_mode: int
     coordinator: TionInstance
