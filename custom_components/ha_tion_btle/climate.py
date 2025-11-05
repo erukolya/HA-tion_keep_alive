@@ -70,7 +70,13 @@ class TionClimateEntity(ClimateEntity, CoordinatorEntity):
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_preset_modes = [PRESET_NONE, PRESET_BOOST, PRESET_SLEEP]
     _attr_preset_mode = PRESET_NONE
-    _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.PRESET_MODE
+   _attr_supported_features = (
+        ClimateEntityFeature.TARGET_TEMPERATURE
+        | ClimateEntityFeature.FAN_MODE
+        | ClimateEntityFeature.PRESET_MODE
+        | ClimateEntityFeature.TURN_ON
+        | ClimateEntityFeature.TURN_OFF
+    )
     _attr_icon = 'mdi:air-purifier'
     _attr_fan_mode: int
     coordinator: TionInstance
@@ -107,28 +113,29 @@ class TionClimateEntity(ClimateEntity, CoordinatorEntity):
         """Set hvac mode."""
         _LOGGER.info("Need to set mode to %s, current mode is %s", hvac_mode, self.hvac_mode)
         if self.hvac_mode == hvac_mode:
-            # Do nothing if mode is same
-            _LOGGER.debug(f"{self.name} is asked for mode {hvac_mode}, but it is already in {self.hvac_mode}. Do "
-                          f"nothing.")
+            _LOGGER.debug(f"{self.name} is asked for mode {hvac_mode}, but it is already in {self.hvac_mode}. Do nothing.")
             pass
+
         elif hvac_mode == HVACMode.OFF:
             # Keep last mode while turning off. May be used while calling climate turn_on service
             self._last_mode = self.hvac_mode
             await self._async_set_state(is_on=False)
 
         elif hvac_mode == HVACMode.HEAT:
+            self._last_mode = HVACMode.HEAT            # ← добавь эту строку
             saved_target_temp = self.target_temperature
             await self._async_set_state(heater=True, is_on=True)
             if self.hvac_mode == HVACMode.FAN_ONLY:
                 await self.async_set_temperature(**{ATTR_TEMPERATURE: saved_target_temp})
 
         elif hvac_mode == HVACMode.FAN_ONLY:
+            self._last_mode = HVACMode.FAN_ONLY        # ← и эту строку
             await self._async_set_state(heater=False, is_on=True)
 
         else:
             _LOGGER.error("Unrecognized hvac mode: %s", hvac_mode)
             return
-        # Ensure we update the current operation after changing the mode
+
         self._handle_coordinator_update()
 
     async def async_set_preset_mode(self, preset_mode: str):
