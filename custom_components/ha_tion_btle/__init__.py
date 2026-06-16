@@ -240,6 +240,13 @@ class TionInstance(DataUpdateCoordinator):
         self.__tion = self.getTion(self.model, self.unique_id)
         self._is_connected = False
 
+    async def _reset_after_protocol_desync(self, reason: str) -> None:
+        """Сбрасывает BLE-клиент после рассинхрона протокола/пакетов."""
+        _LOGGER.warning("BLE protocol desync detected (%s): resetting client", reason)
+        self._need_hard_reset = True
+        self._is_connected = False
+        await self._hard_reset_ble(reason)
+
     async def _prime_services(self) -> None:
         """Мягко «раскачиваем» GATT: пробуем get() с растущей паузой; при длинной серии NotReady сдаёмся."""
         started = time.monotonic()
@@ -361,17 +368,9 @@ class TionInstance(DataUpdateCoordinator):
             self.update_interval = self.__keep_alive
     
         except MaxTriesExceededError as e:
-            try:
-                await self._prime_services()
-                async with self._io_lock:
-                    response = await self.__tion.get()
-                setattr(self, "_fail_count", 0)
-                self.update_interval = self.__keep_alive
-            except Exception as inner:
-                # просим жёсткий ресет на следующий круг
-                self._need_hard_reset = True
-                self._mark_disconnected(f"MaxTriesExceeded after connect: {inner}")
-                raise UpdateFailed("MaxTriesExceeded after connect") from inner
+            await self._reset_after_protocol_desync(f"MaxTriesExceeded on get: {e}")
+            self._mark_disconnected(f"protocol desync / MaxTriesExceeded: {e}")
+            raise UpdateFailed("BLE protocol desync, client reset") from e
         
         except bleak.BleakError as e:
             if self._bleak_service_not_ready(e):
@@ -418,14 +417,14 @@ class TionInstance(DataUpdateCoordinator):
         try:
             await self._ensure_connected()
     
-            # Внутренний try только под MaxTriesExceededError — делаем единичный re-prime и повтор
+            # При рассинхроне протокола не повторяем на старом клиенте, а сбрасываем BLE-сессию.
             try:
                 async with self._io_lock:
                     await self.__tion.set(kwargs)
-            except MaxTriesExceededError:
-                await self._prime_services()
-                async with self._io_lock:
-                    await self.__tion.set(kwargs)
+            except MaxTriesExceededError as e:
+                await self._reset_after_protocol_desync(f"MaxTriesExceeded on set: {e}")
+                self._mark_disconnected(f"protocol desync on set: {e}")
+                raise
     
         except bleak.BleakError as e:
             if self._bleak_service_not_ready(e):
