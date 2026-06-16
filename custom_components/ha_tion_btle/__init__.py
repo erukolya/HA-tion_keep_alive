@@ -16,7 +16,6 @@ from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import BluetoothCallbackMatcher
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from tion_btle.tion import MaxTriesExceededError, Tion
 
@@ -62,8 +61,8 @@ async def async_setup_entry(hass, config_entry: ConfigEntry):
         )
     )
 
-    await instance.async_config_entry_first_refresh()
     await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
+    hass.async_create_task(instance.async_request_refresh())
     return True
 
 
@@ -101,7 +100,11 @@ class TionInstance(DataUpdateCoordinator):
             connectable=True,
         )
         if btle_device is None:
-            raise ConfigEntryNotReady
+            _LOGGER.warning(
+                "BLE device %s is not in discovery cache yet. Will start with MAC and update BLEDevice later.",
+                self.config[CONF_MAC],
+            )
+            btle_device = self.config[CONF_MAC]
 
         keep_alive_seconds: int = TION_SCHEMA[CONF_KEEP_ALIVE]["default"]
         try:
@@ -137,6 +140,7 @@ class TionInstance(DataUpdateCoordinator):
             update_interval=self.__keep_alive,
             update_method=self.async_update_state,
         )
+        self.data = {"model": self.model, "rssi": self.rssi}
 
     @property
     def config(self) -> dict:
@@ -448,14 +452,15 @@ class TionInstance(DataUpdateCoordinator):
 
     @property
     def device_info(self):
+        data = self.data or {}
         info = {
             "identifiers": {(DOMAIN, self.unique_id)},
             "name": self.name,
             "manufacturer": "Tion",
-            "model": self.data.get("model"),
+            "model": data.get("model", self.model),
         }
-        if self.data.get("fw_version") is not None:
-            info["sw_version"] = self.data.get("fw_version")
+        if data.get("fw_version") is not None:
+            info["sw_version"] = data.get("fw_version")
         return info
 
     @callback
