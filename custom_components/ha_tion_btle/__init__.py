@@ -16,6 +16,7 @@ from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import BluetoothCallbackMatcher
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from tion_btle.tion import MaxTriesExceededError, Tion
 
@@ -191,6 +192,7 @@ class TionInstance(DataUpdateCoordinator):
             or "services are not ready" in reason_l
             or "service discovery has not been performed" in reason_l
             or "maxtriesexceeded" in reason_l
+            or "timeout" in reason_l
         )
         if is_handshake:
             self._breaker_level = min(self._breaker_level + 1, 3)
@@ -282,6 +284,8 @@ class TionInstance(DataUpdateCoordinator):
                 await asyncio.sleep(sleep_s)
                 sleep_s = min(sleep_s * 1.5, 2.0)
                 continue
+            except TimeoutError as e:
+                raise UpdateFailed("Handshake failed: BLE operation timed out") from e
             except bleak.BleakError as e:
                 last_err = e
                 if self._bleak_service_not_ready(e):
@@ -321,6 +325,15 @@ class TionInstance(DataUpdateCoordinator):
 
                 await asyncio.sleep(self._initial_settle_s)
                 await self._prime_services()
+
+            except TimeoutError as e:
+                try:
+                    await self.__tion.disconnect()
+                except Exception:
+                    pass
+                self._is_connected = False
+                self._mark_disconnected("connect timeout")
+                raise UpdateFailed("BLE connect timed out") from e
 
             except Exception as e:
                 try:
@@ -370,6 +383,10 @@ class TionInstance(DataUpdateCoordinator):
             self._mark_disconnected(f"protocol desync / MaxTriesExceeded: {e}")
             raise UpdateFailed("BLE protocol desync, client reset") from e
 
+        except TimeoutError as e:
+            self._mark_disconnected(f"TimeoutError: {e}")
+            raise UpdateFailed("BLE operation timed out") from e
+
         except bleak.BleakError as e:
             if self._bleak_service_not_ready(e):
                 self._need_hard_reset = True
@@ -377,7 +394,7 @@ class TionInstance(DataUpdateCoordinator):
             raise UpdateFailed(f"BleakError: {e}") from e
 
         except UpdateFailed as e:
-            if "services are not ready" in str(e).lower():
+            if "services are not ready" in str(e).lower() or "timeout" in str(e).lower():
                 self._need_hard_reset = True
             self._mark_disconnected(str(e))
             raise
@@ -418,19 +435,26 @@ class TionInstance(DataUpdateCoordinator):
             except MaxTriesExceededError as e:
                 await self._reset_after_protocol_desync(f"MaxTriesExceeded on set: {e}")
                 self._mark_disconnected(f"protocol desync on set: {e}")
-                raise
+                raise HomeAssistantError("Tion BLE protocol desync, client reset") from e
+
+        except UpdateFailed as e:
+            raise HomeAssistantError(f"Tion BLE command failed: {e}") from e
+
+        except TimeoutError as e:
+            self._mark_disconnected(f"TimeoutError on set: {e}")
+            raise HomeAssistantError("Tion BLE command timed out") from e
 
         except bleak.BleakError as e:
             if self._bleak_service_not_ready(e):
                 self._need_hard_reset = True
             self._mark_disconnected(f"BleakError on set: {e}")
-            raise
+            raise HomeAssistantError(f"Tion BLE command failed: {e}") from e
 
         except Exception as e:
             self._mark_disconnected(f"{type(e).__name__} on set: {e}")
-            if "service" in str(e).lower():
+            if "service" in str(e).lower() or "timeout" in str(e).lower():
                 self._need_hard_reset = True
-            raise
+            raise HomeAssistantError(f"Tion command failed: {type(e).__name__}: {e}") from e
 
         else:
             self.data.update(original_args)
