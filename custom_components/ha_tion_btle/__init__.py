@@ -23,6 +23,7 @@ from tion_btle.tion import MaxTriesExceededError, Tion
 from .const import CONF_AWAY_TEMP, CONF_KEEP_ALIVE, CONF_MAC, DOMAIN, PLATFORMS, TION_SCHEMA
 
 GLOBAL_BLE_CONNECT_SEM = asyncio.Semaphore(1)
+GLOBAL_BLE_STARTUP_LOCK = asyncio.Lock()
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -142,6 +143,8 @@ class TionInstance(DataUpdateCoordinator):
         self._initial_settle_s = 2.5
         self._io_lock = asyncio.Lock()
         self._config_entry: ConfigEntry = config_entry
+        self._last_btle_device: BLEDevice | None = None
+        self._had_successful_update: bool = False
 
         assert self.config[CONF_MAC] is not None
         btle_device = bluetooth.async_ble_device_from_address(
@@ -155,12 +158,13 @@ class TionInstance(DataUpdateCoordinator):
             btle_device is not None,
             _describe_btle_device(btle_device),
         )
-        if btle_device is None:
+        if btle_device is not None:
+            self._last_btle_device = btle_device
+        else:
             _LOGGER.warning(
                 "TION_DIAG init fallback to MAC: device %s is not in discovery cache yet",
                 self.config[CONF_MAC],
             )
-            btle_device = self.config[CONF_MAC]
 
         keep_alive_seconds: int = TION_SCHEMA[CONF_KEEP_ALIVE]["default"]
         try:
@@ -173,12 +177,13 @@ class TionInstance(DataUpdateCoordinator):
         self._reconnect_delay = timedelta(seconds=10)
         self._prime_timeout_s = 60.0
         self._prime_sleep_s = 0.25
-        self.__tion: Tion = self.getTion(self.model, btle_device)
+        tion_source = self._last_btle_device or self.unique_id
+        self.__tion: Tion = self.getTion(self.model, tion_source)
         _LOGGER.warning(
             "TION_DIAG init Tion object created: model=%s tion_class=%s source=%s",
             self.model,
             type(self.__tion).__name__,
-            _describe_btle_device(btle_device),
+            _describe_btle_device(tion_source),
         )
         self._is_connected: bool = False
         self._connect_lock = asyncio.Lock()
@@ -307,7 +312,7 @@ class TionInstance(DataUpdateCoordinator):
         async with GLOBAL_BLE_CONNECT_SEM:
             _LOGGER.warning("TION_DIAG hard_reset_connection connect start")
             await self.__tion.connect()
-        await asyncio.sleep(self._initial_settle_s)
+            await asyncio.sleep(self._initial_settle_s)
         _LOGGER.warning("TION_DIAG hard_reset_connection done")
 
     async def _hard_reset_ble(self, reason: str) -> None:
@@ -317,13 +322,14 @@ class TionInstance(DataUpdateCoordinator):
             _LOGGER.warning("TION_DIAG hard_reset_ble disconnect done")
         except Exception as e:
             _LOGGER.warning("TION_DIAG hard_reset_ble disconnect failed: %s", e)
-        self.__tion = self.getTion(self.model, self.unique_id)
+        source = self._last_btle_device or self.unique_id
+        self.__tion = self.getTion(self.model, source)
         self._is_connected = False
         _LOGGER.warning(
-            "TION_DIAG hard_reset_ble recreated Tion object: model=%s tion_class=%s source=MAC(%s)",
+            "TION_DIAG hard_reset_ble recreated Tion object: model=%s tion_class=%s source=%s",
             self.model,
             type(self.__tion).__name__,
-            self.unique_id,
+            _describe_btle_device(source),
         )
 
     async def _reset_after_protocol_desync(self, reason: str) -> None:
@@ -429,13 +435,13 @@ class TionInstance(DataUpdateCoordinator):
                     self._need_hard_reset = False
 
                 async with GLOBAL_BLE_CONNECT_SEM:
+                    _LOGGER.warning("TION_DIAG connect lock acquired: unique_id=%s", self.unique_id)
                     _LOGGER.warning("TION_DIAG connect calling tion.connect")
                     await self.__tion.connect()
                     _LOGGER.warning("TION_DIAG connect tion.connect returned: elapsed=%.2fs", time.monotonic() - started)
-
-                _LOGGER.warning("TION_DIAG connect settle sleep: %ss", self._initial_settle_s)
-                await asyncio.sleep(self._initial_settle_s)
-                await self._prime_services()
+                    _LOGGER.warning("TION_DIAG connect settle sleep: %ss", self._initial_settle_s)
+                    await asyncio.sleep(self._initial_settle_s)
+                    await self._prime_services()
 
             except TimeoutError as e:
                 _LOGGER.warning("TION_DIAG connect TimeoutError after %.2fs: %s", time.monotonic() - started, e)
@@ -483,6 +489,14 @@ class TionInstance(DataUpdateCoordinator):
         return state == "on"
 
     async def async_update_state(self):
+        if not self._had_successful_update:
+            _LOGGER.warning("TION_DIAG startup update waiting for global startup lock: unique_id=%s", self.unique_id)
+            async with GLOBAL_BLE_STARTUP_LOCK:
+                _LOGGER.warning("TION_DIAG startup update acquired global startup lock: unique_id=%s", self.unique_id)
+                return await self._async_update_state_inner()
+        return await self._async_update_state_inner()
+
+    async def _async_update_state_inner(self):
         _LOGGER.warning(
             "TION_DIAG update_state start: is_connected=%s data_keys=%s",
             self._is_connected,
@@ -521,7 +535,8 @@ class TionInstance(DataUpdateCoordinator):
             _LOGGER.warning("TION_DIAG update_state UpdateFailed: %s", e)
             if "services are not ready" in str(e).lower() or "timeout" in str(e).lower():
                 self._need_hard_reset = True
-            self._mark_disconnected(str(e))
+            if "connect timed out" not in str(e).lower() and "breaker open" not in str(e).lower():
+                self._mark_disconnected(str(e))
             raise
 
         except Exception as e:
@@ -536,6 +551,7 @@ class TionInstance(DataUpdateCoordinator):
         response["fan_speed"] = int(response["fan_speed"])
         response["rssi"] = self.rssi
 
+        self._had_successful_update = True
         _LOGGER.warning("TION_DIAG update_state normalized success: %s", response)
         return response
 
@@ -550,7 +566,6 @@ class TionInstance(DataUpdateCoordinator):
         if "heater" in kwargs:
             kwargs["heater"] = "on" if kwargs["heater"] else "off"
 
-        args = ", ".join("%s=%r" % x for x in kwargs.items())
         _LOGGER.warning("TION_DIAG set start: original=%s translated=%s is_connected=%s", original_args, kwargs, self._is_connected)
 
         try:
@@ -637,6 +652,7 @@ class TionInstance(DataUpdateCoordinator):
             _describe_btle_device(service_info.device),
         )
         if service_info.device is not None:
+            self._last_btle_device = service_info.device
             self.rssi = service_info.rssi
             self.__tion.update_btle_device(service_info.device)
             _LOGGER.warning("TION_DIAG bluetooth callback updated Tion BLEDevice and RSSI=%s", self.rssi)
