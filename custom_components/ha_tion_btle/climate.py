@@ -116,20 +116,19 @@ class TionClimateEntity(ClimateEntity, CoordinatorEntity):
             await self._async_set_state(is_on=False)
 
         elif hvac_mode == HVACMode.HEAT:
-            self._last_mode = HVACMode.HEAT            # ← добавь эту строку
+            self._last_mode = HVACMode.HEAT
             saved_target_temp = self.target_temperature
             await self._async_set_state(heater=True, is_on=True)
             if self.hvac_mode == HVACMode.FAN_ONLY:
                 await self.async_set_temperature(**{ATTR_TEMPERATURE: saved_target_temp})
 
         elif hvac_mode == HVACMode.FAN_ONLY:
-            self._last_mode = HVACMode.FAN_ONLY        # ← и эту строку
+            self._last_mode = HVACMode.FAN_ONLY
             await self._async_set_state(heater=False, is_on=True)
 
         else:
             _LOGGER.error("Unrecognized hvac mode: %s", hvac_mode)
             return
-
         self._handle_coordinator_update()
 
     async def async_set_preset_mode(self, preset_mode: str):
@@ -149,13 +148,13 @@ class TionClimateEntity(ClimateEntity, CoordinatorEntity):
 
         if preset_mode == PRESET_SLEEP and self.preset_mode != PRESET_SLEEP:
             _LOGGER.info("Going to night mode: will save fan_speed: %s", self.fan_mode)
-            if self._saved_fan_mode is None:
+            if self._saved_fan_mode is None and self.fan_mode is not None:
                 self._saved_fan_mode = int(self.fan_mode)
-            actions.append([self.async_set_fan_mode, {'fan_mode': min(int(self.fan_mode), self.sleep_max_fan_mode)}])
+            actions.append([self.async_set_fan_mode, {'fan_mode': min(int(self.fan_mode or 1), self.sleep_max_fan_mode)}])
 
         if preset_mode == PRESET_BOOST and not self._is_boost:
             self._is_boost = True
-            if self._saved_fan_mode is None:
+            if self._saved_fan_mode is None and self.fan_mode is not None:
                 self._saved_fan_mode = int(self.fan_mode)
             actions.append([self.async_set_fan_mode, {'fan_mode': self.boost_fan_mode}])
 
@@ -234,7 +233,8 @@ class TionClimateEntity(ClimateEntity, CoordinatorEntity):
 
     def _handle_coordinator_update(self) -> None:
         self._get_current_state()
-        if int(self.fan_mode) != self.boost_fan_mode and (self._is_boost or self.preset_mode == PRESET_BOOST):
+        fan_mode = self.fan_mode
+        if fan_mode is not None and int(fan_mode) != self.boost_fan_mode and (self._is_boost or self.preset_mode == PRESET_BOOST):
             _LOGGER.warning(f"I'm in boost mode, but current speed {self.fan_mode} is not equal boost speed "
                             f"{self.boost_fan_mode}. Dropping boost mode")
             self._is_boost = False
@@ -266,7 +266,10 @@ class TionClimateEntity(ClimateEntity, CoordinatorEntity):
 
     @property
     def fan_mode(self) -> str | None:
-        return str(self._attr_fan_mode)
+        value = self._attr_fan_mode
+        if value is None:
+            return None
+        return str(value)
 
     @property
     def fan_modes(self) -> list[str] | None:
