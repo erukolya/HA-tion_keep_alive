@@ -137,6 +137,7 @@ class TionInstance(DataUpdateCoordinator):
     """Tion instance with persistent BLE connection and auto-reconnect."""
 
     def __init__(self, hass: HomeAssistant, config_entry: ConfigEntry):
+        self.hass = hass
         self._breaker_until_ts: float = 0.0
         self._breaker_level: int = 0
         self._need_hard_reset: bool = False
@@ -298,6 +299,50 @@ class TionInstance(DataUpdateCoordinator):
         return (
             "service discovery has not been performed yet" in msg
             or "services are not ready" in msg
+        )
+
+    async def _temporary_disconnect_for_peer_startup(self, peer_unique_id: str) -> None:
+        _LOGGER.warning(
+            "TION_DIAG temporary peer release start: self=%s peer=%s is_connected=%s",
+            self.unique_id,
+            peer_unique_id,
+            self._is_connected,
+        )
+        self._is_connected = False
+        try:
+            await self.__tion.disconnect()
+            _LOGGER.warning("TION_DIAG temporary peer release disconnect done: self=%s", self.unique_id)
+        except Exception as e:
+            _LOGGER.warning("TION_DIAG temporary peer release disconnect failed: self=%s err=%s", self.unique_id, e)
+        self.update_interval = timedelta(seconds=15)
+        self.hass.async_create_task(self._delayed_refresh_after_peer_startup(peer_unique_id, 15))
+
+    async def _delayed_refresh_after_peer_startup(self, peer_unique_id: str, delay_s: float) -> None:
+        await asyncio.sleep(delay_s)
+        if self._is_connected:
+            return
+        _LOGGER.warning(
+            "TION_DIAG scheduled peer recovery refresh: self=%s peer=%s",
+            self.unique_id,
+            peer_unique_id,
+        )
+        await self.async_request_refresh()
+
+    async def _release_connected_peers_for_startup(self) -> None:
+        instances = list(self.hass.data.get(DOMAIN, {}).values())
+        released = 0
+        for other in instances:
+            if other is self or not isinstance(other, TionInstance):
+                continue
+            if not other._is_connected:
+                continue
+            released += 1
+            await other._temporary_disconnect_for_peer_startup(self.unique_id)
+            await asyncio.sleep(1.0)
+        _LOGGER.warning(
+            "TION_DIAG startup peer release done: unique_id=%s released=%s",
+            self.unique_id,
+            released,
         )
 
     async def _hard_reset_connection(self, reason: str, pause_s: float = 0.3) -> None:
@@ -493,6 +538,7 @@ class TionInstance(DataUpdateCoordinator):
             _LOGGER.warning("TION_DIAG startup update waiting for global startup lock: unique_id=%s", self.unique_id)
             async with GLOBAL_BLE_STARTUP_LOCK:
                 _LOGGER.warning("TION_DIAG startup update acquired global startup lock: unique_id=%s", self.unique_id)
+                await self._release_connected_peers_for_startup()
                 return await self._async_update_state_inner()
         return await self._async_update_state_inner()
 
